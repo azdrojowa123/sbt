@@ -62,7 +62,7 @@ object BuildServerProtocol {
     jvmTestEnvironmentProvider = true,
   )
 
-  private val bspReload = "bspReload"
+  val bspReload = "bspReload"
 
   lazy val commands: Seq[Command] = Seq(
     Command.single(bspReload) { (state, reqId) =>

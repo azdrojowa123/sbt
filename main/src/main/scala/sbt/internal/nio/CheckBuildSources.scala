@@ -17,6 +17,7 @@ import sbt.Scope.Global
 import sbt.SlashSyntax0._
 import sbt.internal.CommandStrings.LoadProject
 import sbt.internal.SysProp
+import sbt.internal.server.BuildServerProtocol
 import sbt.internal.util.{ AttributeKey, Terminal }
 import sbt.io.syntax._
 import sbt.nio.FileChanges
@@ -93,7 +94,7 @@ private[sbt] class CheckBuildSources extends AutoCloseable {
     val commands =
       allCmds.flatMap(_.split(";").flatMap(_.trim.split(" ").headOption).filterNot(_.isEmpty))
     val filter = (c: String) =>
-      c == LoadProject || c == RebootCommand || c == TerminateAction || c == Shutdown ||
+      c == LoadProject || c == BuildServerProtocol.bspReload || c == RebootCommand || c == TerminateAction || c == Shutdown ||
         c.startsWith("sbtReboot")
     val resetState = commands.exists(filter)
     if (resetState) {

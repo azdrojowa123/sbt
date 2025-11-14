@@ -23,7 +23,7 @@ import sbt.internal.util.{
   Prompt,
   Terminal => ITerminal
 }
-import sbt.internal.{ ShutdownHooks, TaskProgress }
+import sbt.internal.TaskProgress
 import sbt.io.{ IO, Using }
 import sbt.protocol._
 import sbt.util.{ Logger, LoggerContext }
@@ -307,10 +307,21 @@ object MainLoop {
           .remove(Keys.terminalKey)
           .remove(Keys.currentCommandProgress)
       }
-      state.get(CheckBuildSourcesKey) match {
-        case Some(cbs) =>
-          if (!cbs.needsReload(state, exec)) process()
-          else Exec("reload", None) +: exec +: state.remove(CheckBuildSourcesKey)
+
+      (state.get(CheckBuildSourcesKey), channelName) match {
+        case (Some(cbs), Some(name)) =>
+          val isNetwork = name.startsWith("network")
+          // Allow reload only if it's not a network channel, or if it is a network channel, but the execId is known so it can be used to propagate the error.
+          val canReload = !isNetwork || exec.execId.nonEmpty
+          if (canReload && cbs.needsReload(state, exec)) {
+            val reloadExec =
+              if (!isNetwork) Exec("reload", exec.source)
+              else Exec("loadp", exec.execId, exec.source)
+
+            reloadExec +: exec +: state.remove(CheckBuildSourcesKey)
+          } else {
+            process()
+          }
         case _ => process()
       }
     } catch {
