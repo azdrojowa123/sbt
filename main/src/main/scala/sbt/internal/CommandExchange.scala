@@ -23,6 +23,7 @@ import sbt.BasicCommandStrings.{
   networkExecPrefix
 }
 import sbt.BasicKeys.*
+import sbt.internal.langserver.ErrorCodes
 import sbt.internal.protocol.JsonRpcResponseError
 import sbt.internal.server.*
 import sbt.internal.ui.UITask
@@ -41,6 +42,7 @@ import scala.annotation.tailrec
 import scala.collection.mutable.ListBuffer
 import scala.concurrent.Await
 import scala.concurrent.duration.*
+import scala.jdk.CollectionConverters.*
 import scala.util.{ Failure, Success, Try }
 
 /**
@@ -65,7 +67,19 @@ private[sbt] final class CommandExchange:
   private val lastState = new AtomicReference[State]
   private val currentExecRef = new AtomicReference[Exec]
   private val lastActivityTime = new AtomicLong(System.currentTimeMillis)
+
+  /**
+   * Set when the server starts its final cleanup, after the main loop has stopped. From then on the
+   * server closes the remaining clients itself, so these closes are not a user leaving and must not
+   * ask other sbt servers to drop if idle.
+   */
   private val shuttingDown = new AtomicBoolean(false)
+
+  /**
+   * Set when a `shutdown` command starts running and never cleared, since the exit is then
+   * guaranteed. Keeps network commands rejected until the server exits.
+   */
+  private val shutdownCommandStarted = new AtomicBoolean(false)
   private val clientJobHandoff = new AtomicBoolean(false)
   private val taskError = new AtomicReference[JsonRpcResponseError]
   @volatile private var procFile: Option[File] = None
@@ -455,6 +469,35 @@ private[sbt] final class CommandExchange:
   private[sbt] def setExec(exec: Option[Exec]): Unit =
     currentExecRef.set(exec.orNull)
     lastActivityTime.set(System.currentTimeMillis)
+    if exec.exists(_.commandLine == Shutdown) then
+      shutdownCommandStarted.set(true)
+      rejectQueuedExecs()
+
+  /**
+   * True from the moment a shutdown is queued until the server exits: new commands sent over
+   * the network are rejected while it holds. Once the `shutdown` command starts, it is no longer in
+   * the queue, so [[shutdownCommandStarted]] keeps the gate closed until the server exits.
+   *
+   * @see [[sbt.internal.CommandExchange.hasQueuedShutdown]]
+   */
+  private[sbt] def isShutdownPending: Boolean =
+    shutdownCommandStarted.get || CommandExchange.hasQueuedShutdown(commandQueue.asScala)
+
+  /**
+   * Answers every command queued behind a shutdown with an error, so none is dropped silently
+   * when the server exits. A command can pass the [[isShutdownPending]] check and still be
+   * queued after the shutdown, because a client's thread checks and appends in two steps.
+   */
+  private def rejectQueuedExecs(): Unit =
+    val rejected = new java.util.ArrayList[Exec]
+    commandQueue.drainTo(rejected)
+    rejected.forEach: e =>
+      respondError(
+        ErrorCodes.ServerShuttingDown,
+        CommandExchange.shuttingDownMessage(e.commandLine),
+        e.execId,
+        e.source
+      )
 
   private def idleSeconds: Long =
     (System.currentTimeMillis - lastActivityTime.get) / 1000
@@ -656,6 +699,20 @@ end CommandExchange
 
 private[sbt] object CommandExchange:
   import sbt.protocol.Serialization.dropIfIdle
+
+  /**
+   * Checks whether any of the given commands is [[Shutdown]].
+   *
+   * Matches only the exact command line `shutdown`, because only that is certain to run; a
+   * compound such as ";clean;shutdown" can stop early when a part fails. For a compound, the gate
+   * closes when its `shutdown` part starts.
+   */
+  private[sbt] def hasQueuedShutdown(execs: Iterable[Exec]): Boolean =
+    execs.exists(_.commandLine == Shutdown)
+
+  private[sbt] def shuttingDownMessage(commandLine: String): String =
+    s"sbt server is shutting down; command '$commandLine' was rejected"
+
   val idleHandler: ServerHandler = ServerHandler: callback =>
     ServerIntent(
       onRequest = PartialFunction.empty,
@@ -666,3 +723,4 @@ private[sbt] object CommandExchange:
           ()
       }
     )
+end CommandExchange

@@ -39,6 +39,7 @@ object ErrorCodes {
 
   val UnknownServerError   = -32001L // Defined by LSP
   val ServerNotInitialized = -32002L // Defined by LSP
+  val ServerShuttingDown   = -32003L // sbt: a shutdown is pending, so the command was not queued
 
 
   // The remainder of the space is available for application defined errors.

@@ -7,11 +7,15 @@
 
 package testpkg
 
-import java.io.{ File, InputStream, PrintStream }
+import java.io.{ ByteArrayOutputStream, File, InputStream, PrintStream }
+import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{ Files, Path }
 import java.util.concurrent.{ LinkedBlockingQueue, TimeUnit, TimeoutException }
 import scala.concurrent.duration.*
+import scala.util.Using
 import sbt.internal.client.NetworkClient
+import sbt.internal.langserver.ErrorCodes
+import sbt.internal.protocol.JsonRpcResponseError
 import sbt.internal.util.Util
 import sbt.io.IO
 import sbt.io.syntax.*
@@ -127,6 +131,30 @@ trait AbstractServerTest extends AnyFunSuite with BeforeAndAfterAll:
         false
       )
     )
+
+  /** Like [[runBatchClient]], but also returns the lines the client wrote to its standard output. */
+  protected def runBatchClientWithOutput(args: String*): (Int, Seq[String]) =
+    val buffer = new ByteArrayOutputStream
+    val exitCode = Using.resource(new PrintStream(buffer, true, UTF_8)): out =>
+      background(
+        NetworkClient.client(
+          testPath.toFile,
+          args.toArray,
+          BlockingInputStream,
+          out,
+          nullPrintStream,
+          false
+        )
+      )
+    (exitCode, new String(buffer.toByteArray, UTF_8).linesIterator.toSeq)
+
+  /**
+   * Asserts that `error` is the server's refusal to run `commandLine` because a shutdown is queued
+   * or running: the code is [[ErrorCodes.ServerShuttingDown]] and the message names the command.
+   */
+  protected def assertRejectedByShutdown(error: Option[JsonRpcResponseError], commandLine: String): Unit =
+    assert(error.exists(_.code == ErrorCodes.ServerShuttingDown), error.toString)
+    assert(error.exists(_.message.contains(s"'$commandLine'")), error.toString)
 
   protected def waitUntil(timeout: FiniteDuration)(p: => Boolean): Boolean =
     val deadline = timeout.fromNow

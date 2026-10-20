@@ -30,6 +30,7 @@ import java.util.concurrent.{
 
 import sbt.BasicCommandStrings.{ DashDashDetachStdio, DashDashServer, Shutdown, TerminateAction }
 import sbt.internal.langserver.{
+  ErrorCodes,
   InitializeResult,
   LogMessageParams,
   MessageType,
@@ -862,8 +863,19 @@ class NetworkClient(
         Util.ignoreResult(q.offer(exitCode))
   private val onExecResponse: PartialFunction[JsonRpcResponseMessage, Unit] = {
     case msg if pendingResults.containsKey(msg.id) =>
+      msg.error
+        .filter(_.code == ErrorCodes.ServerShuttingDown)
+        .foreach(e => printServerError(e.message))
       completeExec(msg.id, getExitCode(msg.result))
   }
+
+  /**
+   * A command the server refused to queue never produced any log line on this client, so its
+   * error message is the only explanation the user will get.
+   */
+  private def printServerError(message: String): Unit =
+    if message.nonEmpty then console.appendLog(Level.Error, message)
+
   private val onCancellationResponse: PartialFunction[JsonRpcResponseMessage, Unit] = {
     case msg if pendingCancellations.containsKey(msg.id) =>
       pendingCancellations.remove(msg.id) match

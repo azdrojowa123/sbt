@@ -81,7 +81,14 @@ private[sbt] object LanguageServerProtocol:
         case r: JsonRpcRequestMessage if r.method == "sbt/exec" =>
           checkAuthenticated(r) {
             val param = Converter.fromJson[SbtExecParams](json(r)).get
-            val _ = appendExec(param.commandLine, Some(r.id))
+            if StandardMain.exchange.isShutdownPending then
+              jsonRpcRespondError(
+                Some(r.id),
+                ErrorCodes.ServerShuttingDown,
+                CommandExchange.shuttingDownMessage(param.commandLine)
+              )
+            else
+              val _ = appendExec(param.commandLine, Some(r.id))
           }
 
         case r: JsonRpcRequestMessage if r.method == "sbt/setting" =>
