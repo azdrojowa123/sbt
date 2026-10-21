@@ -34,7 +34,8 @@ import sbt.internal.langserver.{
   InitializeResult,
   LogMessageParams,
   MessageType,
-  PublishDiagnosticsParams
+  PublishDiagnosticsParams,
+  ServerCapabilities
 }
 import sbt.internal.worker.{ ClientJobParams, NativeRunInfo, RunInfo }
 import sbt.internal.protocol.*
@@ -69,6 +70,7 @@ import Serialization.{
   clientJob,
   promptChannel,
   readSystemIn,
+  shutdownRequest,
   systemIn,
   systemErr,
   systemOut,
@@ -167,13 +169,16 @@ class NetworkClient(
   private val connectionHolder = AtomicCloseable[ServerSession]()
   private val batchMode = new AtomicBoolean(false)
   private val serverLogsResult = new AtomicBoolean(false)
+  private val serverAcceptsShutdownRequest = new AtomicBoolean(false)
   private val ranClientSideJob = new AtomicBoolean(false)
   private val interactiveThread = new AtomicReference[Thread](null)
   private val rebooting = new AtomicBoolean(false)
   private lazy val noTab = arguments.completionArguments.contains("--no-tab")
   private lazy val noStdErr = arguments.completionArguments.contains("--no-stderr") &&
     !sys.env.contains("SBTN_AUTO_COMPLETE") && !sys.env.contains("SBTC_AUTO_COMPLETE")
-  private def shutdownOnly = arguments.commandArguments == Seq(Shutdown)
+  private def shutdownOnly =
+    arguments.commandArguments == Seq(Shutdown) || forceShutdownOnly
+  private def forceShutdownOnly = NetworkClient.isForceShutdown(arguments.commandArguments)
   private def exitOnly = arguments.commandArguments == Seq(TerminateAction)
   private lazy val serverAutoStart: Boolean =
     sys.props.get("sbt.server.autostart").forall(_.toLowerCase == "true")
@@ -560,6 +565,7 @@ class NetworkClient(
           else handshake.release(s"sbt server refused the connection: ${err.message}")
         case _ =>
           serverLogsResult.set(NetworkClient.successLogCapability(msg.result))
+          serverAcceptsShutdownRequest.set(NetworkClient.shutdownRequestCapability(msg.result))
           handshake.release()
     pendingResponseHandlers.put(execId, handleHandshakeResponse)
     if handshake.initiateFailed(initCommand(token, execId)) then
@@ -1192,7 +1198,7 @@ class NetworkClient(
         else if exit then 0
         else
           batchMode.set(true)
-          val res = batchExecute(userCommands.toList)
+          val res = if forceShutdownOnly then forceShutdown() else batchExecute(userCommands.toList)
           if !batchMode.get then block() else res
       }
     }
@@ -1200,6 +1206,42 @@ class NetworkClient(
   def batchExecute(userCommands: List[String]): Int =
     val cmd = userCommands.mkString(" ")
     sendAndWait(cmd, None)
+
+  /**
+   * Sends `sbt/shutdown` with `force: true`. As with plain `shutdown`, waits until the client is
+   * disconnected. The server may still be finishing its shutdown. Returns 0 when the connection closes,
+   * 1 when the server refuses the request. A server without the `shutdownRequest` capability gets
+   * plain `shutdown` and a warning instead.
+   *
+   * The server does not disconnect this client early, as it does for `shutdown` typed in a console.
+   */
+  private def forceShutdown(): Int =
+    if !serverAcceptsShutdownRequest.get then
+      console.appendLog(
+        Level.Warn,
+        s"sbt server does not support forced shutdown; falling back to '$Shutdown'"
+      )
+      sendAndWait(Shutdown, None)
+    else
+      // released only when the server answers with an error; success never answers, it closes
+      val refused = CountDownLatch(1)
+      val execId = UUID.randomUUID.toString
+      def handleShutdownResponse(msg: JsonRpcResponseMessage): Unit =
+        msg.error.foreach: err =>
+          printServerError(err.message)
+          refused.countDown()
+      pendingResponseHandlers.put(execId, handleShutdownResponse)
+      sendJson(shutdownRequest, """{"force":true}""", execId)
+      // the connection is already gone, so nothing will ever wake a wait
+      if !running.get then 0
+      else
+        // an accepted shutdown is never answered: the server closes the connection, and onClose
+        // or the shutdown notification then interrupt this thread, as they do for plain `shutdown`
+        try
+          refused.await()
+          1
+        catch case _: InterruptedException => 0
+  end forceShutdown
 
   def getCompletions(query: String): Seq[String] =
     val quoteCount = query.foldLeft(0) {
@@ -1379,11 +1421,25 @@ object NetworkClient:
 
   /** Absent on a server from before this, so that one keeps printing its own line. */
   private[sbt] def successLogCapability(jvalue: Option[JValue]): Boolean =
+    capability(jvalue)(_.successLog)
+
+  /** Absent on a server from before `sbt/shutdown`, which gets plain `shutdown` instead. */
+  private[sbt] def shutdownRequestCapability(jvalue: Option[JValue]): Boolean =
+    capability(jvalue)(_.shutdownRequest)
+
+  private def capability(jvalue: Option[JValue])(
+      flag: ServerCapabilities => Option[Boolean]
+  ): Boolean =
     import sbt.internal.langserver.codec.JsonProtocol.given
     jvalue
       .flatMap(Converter.fromJson[InitializeResult](_).toOption)
-      .flatMap(_.capabilities.successLog)
+      .flatMap(r => flag(r.capabilities))
       .getOrElse(false)
+
+  private[sbt] def isForceShutdown(commandArguments: Seq[String]): Boolean =
+    commandArguments match
+      case Seq(Shutdown, "--force" | "-f") => true
+      case _                               => false
 
   private def consoleAppenderInterface(printStream: PrintStream): ConsoleInterface =
     val appender = ConsoleAppender("thin", ConsoleOut.printStreamOut(printStream))

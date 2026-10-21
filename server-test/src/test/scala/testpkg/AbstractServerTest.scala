@@ -21,9 +21,9 @@ import sbt.io.IO
 import sbt.io.syntax.*
 import sbt.protocol.ServerSession
 import sbt.{ ForkOptions, OutputStrategy, RunFromSourceMain }
-
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.BeforeAndAfterAll
+import sjsonnew.support.scalajson.unsafe.Converter
 
 /**
  * Holds the running sbt server instance: the session for JSON-RPC communication,
@@ -152,9 +152,23 @@ trait AbstractServerTest extends AnyFunSuite with BeforeAndAfterAll:
    * Asserts that `error` is the server's refusal to run `commandLine` because a shutdown is queued
    * or running: the code is [[ErrorCodes.ServerShuttingDown]] and the message names the command.
    */
-  protected def assertRejectedByShutdown(error: Option[JsonRpcResponseError], commandLine: String): Unit =
+  protected def assertRejectedByShutdown(
+      error: Option[JsonRpcResponseError],
+      commandLine: String
+  ): Unit =
     assert(error.exists(_.code == ErrorCodes.ServerShuttingDown), error.toString)
     assert(error.exists(_.message.contains(s"'$commandLine'")), error.toString)
+
+  /**
+   * Waits for the `shutdown` notification the server sends to `session` just before it closes the
+   * connection, and returns its params `(logShutdown, remainingCommands)`.
+   *
+   * @see [[sbt.internal.server.NetworkChannel#shutdown]]
+   */
+  protected def shutdownNotification(session: ServerSession): (Boolean, Option[(String, String)]) =
+    import sjsonnew.BasicJsonProtocol.*
+    val message = session.waitForNotificationMsg(30.seconds)(_.method == "shutdown").get
+    Converter.fromJson[(Boolean, Option[(String, String)])](message.params.get).get
 
   protected def waitUntil(timeout: FiniteDuration)(p: => Boolean): Boolean =
     val deadline = timeout.fromNow

@@ -23,6 +23,7 @@ import sbt.BasicCommandStrings.{
   networkExecPrefix
 }
 import sbt.BasicKeys.*
+import sbt.internal.CommandExchange.ShutdownPhase
 import sbt.internal.langserver.ErrorCodes
 import sbt.internal.protocol.JsonRpcResponseError
 import sbt.internal.server.*
@@ -75,11 +76,8 @@ private[sbt] final class CommandExchange:
    */
   private val shuttingDown = new AtomicBoolean(false)
 
-  /**
-   * Set when a `shutdown` command starts running and never cleared, since the exit is then
-   * guaranteed. Keeps network commands rejected until the server exits.
-   */
-  private val shutdownCommandStarted = new AtomicBoolean(false)
+  /** The current step of the shutdown It can only move to a later step, never back. */
+  private val shutdownPhase = new AtomicReference(ShutdownPhase.Idle)
   private val clientJobHandoff = new AtomicBoolean(false)
   private val taskError = new AtomicReference[JsonRpcResponseError]
   @volatile private var procFile: Option[File] = None
@@ -470,34 +468,94 @@ private[sbt] final class CommandExchange:
     currentExecRef.set(exec.orNull)
     lastActivityTime.set(System.currentTimeMillis)
     if exec.exists(_.commandLine == Shutdown) then
-      shutdownCommandStarted.set(true)
+      advanceShutdown(ShutdownPhase.Started)
       rejectQueuedExecs()
 
   /**
-   * True from the moment a shutdown is queued until the server exits: new commands sent over
-   * the network are rejected while it holds. Once the `shutdown` command starts, it is no longer in
-   * the queue, so [[shutdownCommandStarted]] keeps the gate closed until the server exits.
+   * Moves the shutdown to `next` if that is further along than where it is now. Returns `true`
+   * when this call made the move. Several threads can call it at the same time: exactly one of
+   * them gets `true` for a given step, so the caller that gets `true` owns that step.
+   */
+  private def advanceShutdown(next: ShutdownPhase): Boolean =
+    val previous = shutdownPhase.getAndUpdate(ShutdownPhase.advance(_, next))
+    ShutdownPhase.advance(previous, next) != previous
+
+  /**
+   * True from the moment a shutdown is asked for until the server exits: new commands sent over
+   * the network are rejected while it holds. The phase covers every shutdown that went through
+   * [[requestShutdown]] or [[shutdown]]. The queue scan covers a `shutdown` sent as a plain
+   * command, which is only known from the queue.
    *
    * @see [[sbt.internal.CommandExchange.hasQueuedShutdown]]
    */
   private[sbt] def isShutdownPending: Boolean =
-    shutdownCommandStarted.get || CommandExchange.hasQueuedShutdown(commandQueue.asScala)
+    shutdownPhase.get != ShutdownPhase.Idle || CommandExchange.hasQueuedShutdown(
+      commandQueue.asScala
+    )
 
   /**
    * Answers every command queued behind a shutdown with an error, so none is dropped silently
    * when the server exits. A command can pass the [[isShutdownPending]] check and still be
    * queued after the shutdown, because a client's thread checks and appends in two steps.
+   *
+   * A queued `shutdown` gets no error, because what it asked for is happening: its client learns
+   * it from the closed connection. One is found here only when a forced shutdown takes over a
+   * graceful one, or when a `shutdown` sent as a plain command slipped past the check in a race.
    */
   private def rejectQueuedExecs(): Unit =
-    val rejected = new java.util.ArrayList[Exec]
-    commandQueue.drainTo(rejected)
-    rejected.forEach: e =>
-      respondError(
-        ErrorCodes.ServerShuttingDown,
-        CommandExchange.shuttingDownMessage(e.commandLine),
-        e.execId,
-        e.source
-      )
+    val drained = new java.util.ArrayList[Exec]
+    commandQueue.drainTo(drained)
+    drained.asScala
+      .filterNot(_.commandLine == Shutdown)
+      .foreach: e =>
+        respondError(
+          ErrorCodes.ServerShuttingDown,
+          CommandExchange.shuttingDownMessage(e.commandLine),
+          e.execId,
+          e.source
+        )
+
+  /**
+   * Handles an `sbt/shutdown` request. Returns false when the request is rejected, so the caller
+   * answers it with [[sbt.internal.langserver.ErrorCodes.ServerShuttingDown]].
+   *
+   * A request is accepted only when it moves the shutdown forward: a graceful one when no
+   * shutdown is pending yet, a forced one when no forced shutdown is pending yet. So a force
+   * takes over a waiting graceful shutdown, but a second force or a second graceful request is rejected.
+   *
+   * A graceful request queues a `shutdown` behind the running command. A forced one cancels the
+   * running command and rejects the queued ones. `respond` gets the answer before the shutdown is
+   * queued, so the answer is on its way before the shutdown closes the channel.
+   *
+   * Even a forced shutdown request may have to wait for the running command to finish,
+   * because cancellation only reaches the task engine. Unlike shutdown typed in a console,
+   * this request does not disconnect the requesting channel early ([[sbt.internal.CommandExchange.FastTrackThread#run()]]).
+   * Like all other channels, it stays open until the server exits.
+   */
+  private[sbt] def requestShutdown(
+      channelName: String,
+      force: Boolean,
+      respond: ExecStatusEvent => Unit
+  ): Boolean =
+    val execId = Some(Exec.newExecId)
+    if force then
+      val accepted = advanceShutdown(ShutdownPhase.Forced)
+      if accepted then
+        respond(ExecStatusEvent("Processing", Some(channelName), execId, Vector.empty))
+        shutdown(channelName, execId.get)
+      accepted
+    else
+      val accepted =
+        !CommandExchange.hasQueuedShutdown(commandQueue.asScala) && advanceShutdown(
+          ShutdownPhase.Graceful
+        )
+      if accepted then
+        val message = currentExec.map(e => CommandExchange.waitingForMessage(e.commandLine))
+        val status = if message.isDefined then "Queued" else "Processing"
+        respond(ExecStatusEvent(status, Some(channelName), execId, Vector.empty, None, message))
+        commandQueue.add(Exec(Shutdown, execId, Some(CommandSource(channelName))))
+      accepted
+  end requestShutdown
 
   private def idleSeconds: Long =
     (System.currentTimeMillis - lastActivityTime.get) / 1000
@@ -580,12 +638,19 @@ private[sbt] final class CommandExchange:
         case c                  => c.shutdown(false)
       }
 
-  private[sbt] def shutdown(name: String): Unit =
-    Option(currentExecRef.get).foreach(cancel)
-    commandQueue.clear()
-    val exit = Exec(Shutdown, Some(Exec.newExecId), Some(CommandSource(name)))
-    commandQueue.add(exit)
-    ()
+  /**
+   * Forces a shutdown: replaces the queue with a `shutdown` and then cancels the running command,
+   * so the main loop finds nothing else to start once the cancelled command ends. `execId` is the
+   * id the queued `shutdown` gets, so an `sbt/shutdown` request can name it in its answer before
+   * queueing it. Marks the shutdown as forced first, so the gate stays closed while the queue is being replaced.
+   */
+  private[sbt] def shutdown(name: String, execId: String = Exec.newExecId): Unit =
+    advanceShutdown(ShutdownPhase.Forced)
+    val running = currentExec
+    rejectQueuedExecs()
+    commandQueue.add(Exec(Shutdown, Some(execId), Some(CommandSource(name))))
+    running.foreach(cancel)
+
   private def cancel(e: Exec): Unit =
     if e.commandLine.startsWith("console") then
       val terminal = Terminal.get
@@ -712,6 +777,30 @@ private[sbt] object CommandExchange:
 
   private[sbt] def shuttingDownMessage(commandLine: String): String =
     s"sbt server is shutting down; command '$commandLine' was rejected"
+
+  /** The error message for an `sbt/shutdown` request that [[CommandExchange.requestShutdown]] rejected. */
+  private[sbt] def shutdownRejectedMessage(force: Boolean): String =
+    if force then "sbt server is already shutting down; the forced shutdown was rejected"
+    else shuttingDownMessage(Shutdown)
+
+  /**
+   * The steps a shutdown goes through. It never goes back: once asked for, a shutdown cannot be
+   * taken back, only sped up by forcing it. `Idle` means no shutdown was asked for. `Graceful`
+   * means a `shutdown` waits in the queue for the running command. `Forced` means the running
+   * command was cancelled and nothing but `shutdown` is left in the queue. `Started` means the
+   * `shutdown` command runs and the server is about to exit.
+   */
+  private[sbt] enum ShutdownPhase:
+    case Idle, Graceful, Forced, Started
+
+  private[sbt] object ShutdownPhase:
+    /** The phase after asking for `requested` while in `current`. It is the further one of the two. */
+    def advance(current: ShutdownPhase, requested: ShutdownPhase): ShutdownPhase =
+      if requested.ordinal > current.ordinal then requested else current
+
+  private[sbt] def waitingForMessage(commandLine: String): String =
+    if commandLine.length > 50 then s"waiting for: ${commandLine.take(50)}..."
+    else s"waiting for: $commandLine"
 
   val idleHandler: ServerHandler = ServerHandler: callback =>
     ServerIntent(

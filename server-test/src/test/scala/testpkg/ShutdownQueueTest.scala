@@ -11,7 +11,7 @@ package testpkg
 import scala.concurrent.duration.*
 import sbt.io.IO
 import sbt.io.syntax.*
-import sbt.internal.langserver.{ LogMessageParams, SbtExecParams }
+import sbt.internal.langserver.{ LogMessageParams, SbtExecParams, SbtShutdownParams }
 import sbt.internal.langserver.codec.JsonProtocol.given
 import sbt.protocol.ExecStatusEvent
 import sbt.protocol.codec.JsonProtocol.given
@@ -19,9 +19,9 @@ import sbt.protocol.codec.JsonProtocol.given
 /**
  * A `shutdown` that is queued behind a running command closes the queue right away: any `sbt/exec`
  * sent after it, whether over raw JSON-RPC or from the thin client, is rejected with
- * `ServerShuttingDown` instead of being queued and dropped. This includes a second `shutdown`,
- * which must not queue up behind the first one. The running command still completes, and the
- * server then exits.
+ * `ServerShuttingDown` instead of being queued and dropped. This includes a second graceful
+ * shutdown, which must not queue up behind the first one and gets the same error whether it is sent
+ * as `sbt/exec shutdown` or as `sbt/shutdown`. The running command still completes, and the server then exits.
  */
 class ShutdownQueueTest extends AbstractServerTest:
   override val testDirectory: String = "shutdown"
@@ -52,6 +52,11 @@ class ShutdownQueueTest extends AbstractServerTest:
     svr.session.sendJsonRpc(secondShutdownId, "sbt/exec", SbtExecParams("shutdown")).get
     val secondShutdownError = svr.session.waitForResponseMsg(10.seconds, secondShutdownId).get.error
     assertRejectedByShutdown(secondShutdownError, "shutdown")
+
+    val requestId = svr.session.nextId()
+    svr.session.sendJsonRpc(requestId, "sbt/shutdown", SbtShutdownParams(Some(false))).get
+    val requestError = svr.session.waitForResponseMsg(10.seconds, requestId).get.error
+    assert(requestError == secondShutdownError, s"$requestError != $secondShutdownError")
 
     val (exitCode, lines) = runBatchClientWithOutput("quickTask")
     assert(exitCode == 1, lines.mkString("\n"))
